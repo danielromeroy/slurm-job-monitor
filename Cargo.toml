@@ -1,0 +1,12 @@
+[package]
+name = "slurm_job_monitor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+env_logger = "0.11.11"
+log = "0.4.33"
+nvml-wrapper = "0.12.1"
+regex = "1.12.4"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
