@@ -1,7 +1,10 @@
 use chrono::NaiveDateTime;
-use nvml_wrapper::Nvml;
+use nvml_wrapper::enums::device::UsedGpuMemory;
+use nvml_wrapper::struct_wrappers::device::{ProcessInfo, ProcessUtilizationSample};
+use nvml_wrapper::{Device, Nvml};
 use regex::Regex;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, thread, time};
@@ -11,7 +14,7 @@ const SHARDS_PER_GPU: u16 = 2;
 #[derive(Debug)]
 enum JobPIDs {
     JobFinished,
-    PIDs(Vec<u64>),
+    PIDs(Vec<u32>),
 }
 
 fn get_job_pids(job_id: &str) -> Result<JobPIDs, String> {
@@ -61,7 +64,7 @@ fn get_job_pids(job_id: &str) -> Result<JobPIDs, String> {
         eprintln!("WARNING: Expected PID column to be 0, but was {pid_idx}");
     }
 
-    let pids: Result<Vec<u64>, String> = line_splits
+    let pids: Result<Vec<u32>, String> = line_splits
         .iter()
         .skip(1)
         .map(|line_split| {
@@ -260,6 +263,82 @@ fn unix_timestamp() -> f64 {
     timestamp
 }
 
+#[derive(Debug)]
+struct JobResourceUsage {
+    gpu_memory: u64,
+    gpu_utilization: u32,
+}
+
+fn gpu_utilization_stats(pids: &[u32]) -> Result<(u32, u64), String> {
+    let nvml = Nvml::init().map_err(|err| format!("unable to initialize NVML: {err}"))?;
+
+    let n_gpus = nvml
+        .device_count()
+        .map_err(|err| format!("unable to get GPU count: {err}"))?;
+
+    let gpu_devices = (0..n_gpus)
+        .map(|gpu_idx| {
+            nvml.device_by_index(gpu_idx)
+                .map_err(|err| format!("unable to get GPU device at index {gpu_idx}: {err}"))
+        })
+        .collect::<Result<Vec<Device<'_>>, String>>()?;
+
+    let pids_hash: HashSet<u32> = pids.iter().copied().collect();
+
+    let total_gpu_memory_usage: u64 = gpu_devices
+        .iter()
+        .map(|device| {
+            device.running_compute_processes().map_err(|err| {
+                format!("unable to get compute processes for device {device:?}: {err}")
+            })
+        })
+        .collect::<Result<Vec<Vec<ProcessInfo>>, String>>()?
+        .into_iter()
+        .flatten()
+        .filter(|proc_info| pids_hash.contains(&proc_info.pid))
+        .map(|proc_info| match proc_info.used_gpu_memory {
+            UsedGpuMemory::Used(bytes) => Ok(bytes),
+            UsedGpuMemory::Unavailable => Err(format!(
+                "GPU memory usage unavailable for process {}",
+                &proc_info.pid
+            )),
+        })
+        .collect::<Result<Vec<u64>, String>>()?
+        .iter()
+        .sum();
+
+    dbg!(total_gpu_memory_usage);
+
+    let total_gpu_utilization: u32 = gpu_devices
+        .iter()
+        .map(|device| {
+            device.process_utilization_stats(None).map_err(|err| {
+                format!("unable to get process utilization stats for device {device:?}: {err}")
+            })
+        })
+        .collect::<Result<Vec<Vec<ProcessUtilizationSample>>, String>>()?
+        .into_iter()
+        .flatten()
+        .filter(|proc_util_stats| pids_hash.contains(&proc_util_stats.pid))
+        .map(|proc_util_stats| proc_util_stats.sm_util)
+        .sum();
+
+    Ok((total_gpu_utilization, total_gpu_memory_usage))
+}
+
+fn get_job_resource_usage(pids: &[u32], is_gpu_job: bool) -> Result<JobResourceUsage, String> {
+    let (gpu_utilization, gpu_memory) = if is_gpu_job {
+        gpu_utilization_stats(pids)?
+    } else {
+        (0, 0)
+    };
+
+    Ok(JobResourceUsage {
+        gpu_memory,
+        gpu_utilization,
+    })
+}
+
 fn main() -> Result<(), String> {
     let Ok(job_id) = env::var("SLURM_JOB_ID") else {
         return Err("SLURM_JOB_ID is not set".to_string());
@@ -272,12 +351,11 @@ fn main() -> Result<(), String> {
 
     #[allow(clippy::never_loop)]
     while let JobPIDs::PIDs(pids) = get_job_pids(&job_id)? {
-        dbg!(pids);
+        dbg!(&pids);
         let timestamp = unix_timestamp();
-        dbg!(timestamp);
+        dbg!(get_job_resource_usage(&pids, job_info.is_gpu_job)?);
 
         thread::sleep(time::Duration::from_millis(500));
-        break;
     }
 
     Ok(())
