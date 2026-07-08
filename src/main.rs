@@ -2,6 +2,7 @@ use nvml_wrapper::Nvml;
 use regex::Regex;
 use serde::Serialize;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, thread, time};
 
 const SHARDS_PER_GPU: u16 = 2;
@@ -23,7 +24,7 @@ fn get_job_pids(job_id: &str) -> Result<JobPIDs, String> {
     let stderr = String::from_utf8_lossy(&listpids_output.stderr);
 
     // eprint!("{stdout}");
-    // eprint!(&stderr);
+    // eprint!("{stderr}");
 
     #[allow(clippy::items_after_statements)]
     const FINISHED_JOB_MSG: &str = "There are no steps for job";
@@ -232,6 +233,17 @@ fn get_job_info(job_id: &str) -> Result<JobInfo, String> {
     })
 }
 
+fn unix_timestamp() -> f64 {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("you are a time traveller?");
+
+    #[allow(clippy::cast_precision_loss)]
+    let timestamp = duration.as_secs() as f64 + f64::from(duration.subsec_nanos()) * 1e-9;
+
+    timestamp
+}
+
 fn main() -> Result<(), String> {
     let Ok(job_id) = env::var("SLURM_JOB_ID") else {
         return Err("SLURM_JOB_ID is not set".to_string());
@@ -245,6 +257,9 @@ fn main() -> Result<(), String> {
     #[allow(clippy::never_loop)]
     while let JobPIDs::PIDs(pids) = get_job_pids(&job_id)? {
         dbg!(pids);
+        let timestamp = unix_timestamp();
+        dbg!(timestamp);
+
         thread::sleep(time::Duration::from_millis(500));
         break;
     }
