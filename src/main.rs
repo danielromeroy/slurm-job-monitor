@@ -1,7 +1,10 @@
+use nvml_wrapper::Nvml;
 use regex::Regex;
 use serde::Serialize;
-use std::process::{Command, exit};
+use std::process::Command;
 use std::{env, thread, time};
+
+const SHARDS_PER_GPU: u16 = 2;
 
 #[derive(Debug)]
 enum JobPIDs {
@@ -10,8 +13,6 @@ enum JobPIDs {
 }
 
 fn get_job_pids(job_id: &str) -> Result<JobPIDs, String> {
-    dbg!(&job_id);
-
     let listpids_output = Command::new("scontrol")
         .arg("listpids")
         .arg(job_id)
@@ -21,8 +22,8 @@ fn get_job_pids(job_id: &str) -> Result<JobPIDs, String> {
     let stdout = String::from_utf8_lossy(&listpids_output.stdout);
     let stderr = String::from_utf8_lossy(&listpids_output.stderr);
 
-    eprint!("{stdout}");
-    // dbg!(&stderr);
+    // eprint!("{stdout}");
+    // eprint!(&stderr);
 
     #[allow(clippy::items_after_statements)]
     const FINISHED_JOB_MSG: &str = "There are no steps for job";
@@ -33,8 +34,8 @@ fn get_job_pids(job_id: &str) -> Result<JobPIDs, String> {
     }
 
     if !listpids_output.status.success() {
-        dbg!(listpids_output.status.code());
-        exit(listpids_output.status.code().unwrap_or(1));
+        let return_code = listpids_output.status.code();
+        return Err(format!("listpids exited with code {return_code:?}"));
     }
 
     if !stderr.is_empty() {
@@ -42,14 +43,10 @@ fn get_job_pids(job_id: &str) -> Result<JobPIDs, String> {
         eprintln!("listpids produced stderr:\n{stderr}");
     }
 
-    // dbg!(&stdout.lines().collect::<Vec<_>>());
-
     let line_splits = stdout
         .lines()
         .map(|line| line.split_whitespace().collect::<Vec<_>>())
         .collect::<Vec<_>>();
-
-    // dbg!(&line_splits);
 
     let pid_idx = line_splits
         .first()
@@ -112,6 +109,20 @@ fn get_first_regex_group(regex: &str, haystack: &str) -> Result<String, String> 
         .to_string())
 }
 
+fn get_total_gpu_memory(gpu_index: u32) -> Result<u64, String> {
+    let nvml = Nvml::init().map_err(|err| format!("unable to initialize NVML: {err}"))?;
+
+    let device = nvml
+        .device_by_index(gpu_index)
+        .map_err(|err| format!("failed to get NVML device at index {gpu_index}: {err}"))?;
+
+    // this is always in bytes I think
+    Ok(device
+        .memory_info()
+        .map_err(|err| format!("failed to get GPU memory information: {err}"))?
+        .total)
+}
+
 #[allow(clippy::similar_names)]
 fn get_job_info(job_id: &str) -> Result<JobInfo, String> {
     let scontrol_show_output = Command::new("scontrol")
@@ -125,15 +136,13 @@ fn get_job_info(job_id: &str) -> Result<JobInfo, String> {
     let stdout = String::from_utf8_lossy(&scontrol_show_output.stdout);
     let stderr = String::from_utf8_lossy(&scontrol_show_output.stderr);
 
-    // dbg!(&stdout);
-    // dbg!(&stderr);
+    // eprint!(&stdout);
+    // eprint!(&stderr);
 
     if !stderr.is_empty() {
         // TODO: log at warning level
         eprintln!("scontrol show produced stderr:\n{stderr}");
     }
-
-    // eprint!("{stdout}");
 
     let is_array_task = stdout.contains("ArrayTaskId");
 
@@ -163,12 +172,12 @@ fn get_job_info(job_id: &str) -> Result<JobInfo, String> {
         (None, None)
     };
 
-    let requested_cpus = get_first_regex_group(r"\sNumCPUs=(\d+)", &stdout)?
+    let requested_cpus = get_first_regex_group(r"NumCPUs=(\d+)", &stdout)?
         .parse::<u16>()
         .map_err(|err| format!("failed to parse requested_cpus: {err}"))?;
 
     // this is always in megabytes I think
-    let requested_memory = get_first_regex_group(r"\sMem=(\d+)", &stdout)?
+    let requested_memory = get_first_regex_group(r"Mem=(\d+)", &stdout)?
         .parse::<u64>()
         .map_err(|err| format!("failed to parse requested_memory: {err}"))?;
 
@@ -179,11 +188,25 @@ fn get_job_info(job_id: &str) -> Result<JobInfo, String> {
         .contains("shard");
 
     let (requested_gpu_shards, requested_gpus, requested_gpu_memory) = if is_gpu_job {
-        let requested_gpu_shards = get_first_regex_group(r"\sJOB_GRES=.*?shards:(\d+)", &stdout)?
+        let requested_gpu_shards = get_first_regex_group(r"JOB_GRES=.*?shard:(\d+)", &stdout)?
             .parse::<u8>()
             .map_err(|err| format!("failed to parse requested_gpu_shards: {err}"))?;
 
-        (requested_gpu_shards, 0.0, 0)
+        let requested_gpus = f32::from(requested_gpu_shards) / f32::from(SHARDS_PER_GPU);
+
+        let total_gpu_memory = get_total_gpu_memory(0)?; // assume all GPUs are equal
+
+        dbg!(total_gpu_memory);
+
+        #[allow(clippy::cast_precision_loss)]
+        let requested_gpu_memory = total_gpu_memory as f64 * f64::from(requested_gpus);
+        dbg!(requested_gpu_memory);
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let requested_gpu_memory = requested_gpu_memory as u64;
+        dbg!(requested_gpu_memory);
+
+        (requested_gpu_shards, requested_gpus, requested_gpu_memory)
     } else {
         (0, 0.0, 0)
     };
@@ -217,9 +240,11 @@ fn main() -> Result<(), String> {
 
     dbg!(&job_info);
 
+    #[allow(clippy::never_loop)]
     while let JobPIDs::PIDs(pids) = get_job_pids(&job_id)? {
         dbg!(pids);
         thread::sleep(time::Duration::from_millis(500));
+        break;
     }
 
     Ok(())
