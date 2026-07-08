@@ -97,16 +97,18 @@ fn get_first_regex_group(regex: &str, haystack: &str) -> Result<String, String> 
     let regex_obj = Regex::new(regex).map_err(|err| format!("failed to build regex: {err}"))?;
 
     let captures = regex_obj.captures(haystack).ok_or(format!(
-        "failed to match regex '{regex}' in haystack:\n{haystack:?}"
+        "failed to match regex '{regex}' in haystack: '{haystack}'"
     ))?;
 
-    Ok(captures
+    let captured_string = captures
         .get(1)
         .ok_or(format!(
-            "no groups captured ({captures:?}) for regex '{regex}' in haystack '{haystack:?}'"
+            "no groups captured ({captures:?}) for regex '{regex}' in haystack '{haystack}'"
         ))?
         .as_str()
-        .to_string())
+        .to_string();
+
+    Ok(captured_string)
 }
 
 fn get_total_gpu_memory(gpu_index: u32) -> Result<u64, String> {
@@ -117,10 +119,12 @@ fn get_total_gpu_memory(gpu_index: u32) -> Result<u64, String> {
         .map_err(|err| format!("failed to get NVML device at index {gpu_index}: {err}"))?;
 
     // this is always in bytes I think
-    Ok(device
+    let total_memory = device
         .memory_info()
         .map_err(|err| format!("failed to get GPU memory information: {err}"))?
-        .total)
+        .total;
+
+    Ok(total_memory)
 }
 
 #[allow(clippy::similar_names)]
@@ -136,8 +140,8 @@ fn get_job_info(job_id: &str) -> Result<JobInfo, String> {
     let stdout = String::from_utf8_lossy(&scontrol_show_output.stdout);
     let stderr = String::from_utf8_lossy(&scontrol_show_output.stderr);
 
-    // eprint!(&stdout);
-    // eprint!(&stderr);
+    eprint!("{stdout}");
+    // eprint!("{stderr}");
 
     if !stderr.is_empty() {
         // TODO: log at warning level
@@ -210,8 +214,6 @@ fn get_job_info(job_id: &str) -> Result<JobInfo, String> {
     } else {
         (0, 0.0, 0)
     };
-
-    // let requested_gpu_shards = get_first_regex_group(r"\sJOB_GRES", haystack)
 
     Ok(JobInfo {
         user_name,
