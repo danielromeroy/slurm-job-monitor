@@ -1,3 +1,4 @@
+use chrono::NaiveDateTime;
 use nvml_wrapper::Nvml;
 use regex::Regex;
 use serde::Serialize;
@@ -79,10 +80,12 @@ fn get_job_pids(job_id: &str) -> Result<JobPIDs, String> {
 
 #[derive(Debug, Serialize)]
 struct JobInfo {
-    user_name: String,
-    user_id: usize,
     job_id: u32,
     job_name: String,
+    user_name: String,
+    user_id: usize,
+    submit_time: i64,
+    start_time: i64,
     is_array_task: bool,
     array_job_id: Option<u32>,
     array_task_id: Option<u32>,
@@ -128,7 +131,7 @@ fn get_total_gpu_memory(gpu_index: u32) -> Result<u64, String> {
     Ok(total_memory)
 }
 
-#[allow(clippy::similar_names)]
+#[allow(clippy::similar_names, clippy::items_after_statements)]
 fn get_job_info(job_id: &str) -> Result<JobInfo, String> {
     let scontrol_show_output = Command::new("scontrol")
         .arg("show")
@@ -177,6 +180,21 @@ fn get_job_info(job_id: &str) -> Result<JobInfo, String> {
         (None, None)
     };
 
+    const TIME_REGEX: &str = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}";
+    const TIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
+
+    let submit_time = get_first_regex_group(&format!("SubmitTime=({TIME_REGEX})"), &stdout)?;
+    let submit_time = NaiveDateTime::parse_from_str(&submit_time, TIME_FORMAT)
+        .map_err(|err| format!("unable to parse date '{submit_time}': {err}"))?
+        .and_utc()
+        .timestamp();
+
+    let start_time = get_first_regex_group(&format!("StartTime=({TIME_REGEX})"), &stdout)?;
+    let start_time = NaiveDateTime::parse_from_str(&start_time, TIME_FORMAT)
+        .map_err(|err| format!("unable to parse date '{start_time}': {err}"))?
+        .and_utc()
+        .timestamp();
+
     let requested_cpus = get_first_regex_group(r"NumCPUs=(\d+)", &stdout)?
         .parse::<u16>()
         .map_err(|err| format!("failed to parse requested_cpus: {err}"))?;
@@ -201,15 +219,11 @@ fn get_job_info(job_id: &str) -> Result<JobInfo, String> {
 
         let total_gpu_memory = get_total_gpu_memory(0)?; // assume all GPUs are equal
 
-        dbg!(total_gpu_memory);
-
         #[allow(clippy::cast_precision_loss)]
         let requested_gpu_memory = total_gpu_memory as f64 * f64::from(requested_gpus);
-        dbg!(requested_gpu_memory);
 
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let requested_gpu_memory = requested_gpu_memory as u64;
-        dbg!(requested_gpu_memory);
 
         (requested_gpu_shards, requested_gpus, requested_gpu_memory)
     } else {
@@ -217,10 +231,12 @@ fn get_job_info(job_id: &str) -> Result<JobInfo, String> {
     };
 
     Ok(JobInfo {
-        user_name,
-        user_id,
         job_id,
         job_name,
+        user_name,
+        user_id,
+        submit_time,
+        start_time,
         is_array_task,
         array_job_id,
         array_task_id,
