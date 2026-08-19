@@ -1,4 +1,5 @@
 use chrono::NaiveDateTime;
+use clap::Parser;
 use gethostname::gethostname;
 use nvml_wrapper::enums::device::UsedGpuMemory;
 use nvml_wrapper::struct_wrappers::device::{ProcessInfo, ProcessUtilizationSample};
@@ -6,12 +7,33 @@ use nvml_wrapper::{Device, Nvml};
 use regex::Regex;
 use serde::Serialize;
 use std::collections::HashSet;
-use std::fs::{self, exists, read_to_string};
+use std::fs;
+use std::fs::{create_dir_all, exists, read_to_string};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::{dbg, env, thread, time};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{dbg, env, thread};
 
 const SHARDS_PER_GPU: u16 = 2;
+
+#[derive(Parser, Debug)]
+struct Args {
+    #[arg(
+        short = 'o',
+        long = "output-dir",
+        required = true,
+        help = "Directory to write monitoring output"
+    )]
+    output_dir: String,
+
+    #[arg(
+        short = 'i',
+        long = "interval-seconds",
+        required = false,
+        default_value = "0.5",
+        help = "Monitoring interval in seconds (must be between 0 and 300)"
+    )]
+    interval: f32,
+}
 
 #[derive(Debug)]
 enum JobPIDs {
@@ -368,11 +390,11 @@ fn get_memory_usage(job_id: u32) -> Result<u64, String> {
     let memory_stat_path = format!("{cgroup_dir}/memory.stat");
     let current_memory_path = format!("{cgroup_dir}/memory.current");
 
-    let mut current_mem_contents = read_to_string(&current_memory_path)
-        .map_err(|err| format!("failed to read {current_memory_path}: {err}"))?;
-
     let mem_stat_contents = read_to_string(&memory_stat_path)
         .map_err(|err| format!("failed to read {memory_stat_path}: {err}"))?;
+
+    let mut current_mem_contents = read_to_string(&current_memory_path)
+        .map_err(|err| format!("failed to read {current_memory_path}: {err}"))?;
 
     current_mem_contents.retain(|c| !c.is_whitespace());
 
@@ -426,8 +448,8 @@ fn get_cpu_usage(job_id: u32) -> Result<u64, String> {
 }
 
 fn get_job_resource_usage(job_info: &JobInfo, pids: &[u32]) -> Result<JobResourceUsage, String> {
-    let memory = get_memory_usage(job_info.job_id)?;
     let cpu_utilization = get_cpu_usage(job_info.job_id)?;
+    let memory = get_memory_usage(job_info.job_id)?;
 
     let (gpu_utilization, gpu_memory) = if job_info.is_gpu_job {
         gpu_utilization_stats(pids)?
@@ -443,7 +465,41 @@ fn get_job_resource_usage(job_info: &JobInfo, pids: &[u32]) -> Result<JobResourc
     })
 }
 
+fn log_usage_stats(
+    timestamp: f64,
+    job_resource_usage: &JobResourceUsage,
+    csv_writer: &mut csv::Writer<fs::File>,
+) -> Result<(), String> {
+    csv_writer
+        .write_record(vec![
+            timestamp.to_string(),
+            job_resource_usage.cpu_utilization.to_string(),
+            job_resource_usage.memory.to_string(),
+            job_resource_usage.gpu_utilization.to_string(),
+            job_resource_usage.gpu_memory.to_string(),
+        ])
+        .map_err(|err| format!("failed to write CSV record: {err}"))?;
+
+    csv_writer
+        .flush()
+        .map_err(|err| format!("failed to flush CSV writer buffer: {err}"))?;
+
+    Ok(())
+}
+
 fn main() -> Result<(), String> {
+    let args = Args::parse();
+
+    if args.interval < 0.0 || args.interval > 300.0 {
+        return Err(format!(
+            "monitoring interval ({}) must be between 0 and 300 seconds",
+            args.interval
+        ));
+    }
+
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let sleep_interval = Duration::from_millis((args.interval * 1000.0) as u64);
+
     let Ok(job_id) = env::var("SLURM_JOB_ID") else {
         return Err("SLURM_JOB_ID is not set".to_string());
     };
@@ -453,19 +509,40 @@ fn main() -> Result<(), String> {
 
     dbg!(&job_info);
 
-    #[allow(clippy::never_loop)]
+    print!("{}", serde_json::to_string_pretty(&job_info).unwrap());
+
+    create_dir_all(&args.output_dir).map_err(|err| {
+        format!(
+            "failed to create output directory '{}': {}",
+            args.output_dir, err
+        )
+    })?;
+
+    let mut csv_writer = csv::Writer::from_path(format!("{}/usage_stats.csv", args.output_dir))
+        .map_err(|err| format!("unable to create CSV file: {err}"))?;
+
+    csv_writer
+        .write_record(vec![
+            "timestamp",
+            "cpu_usage",
+            "memory",
+            "gpu_usage",
+            "gpu_memory",
+        ])
+        .map_err(|err| format!("failed to write output CSV header: {err}"))?;
+
     while let JobPIDs::PIDs(pids) = get_job_pids(job_info.job_id)? {
         dbg!(&pids);
         let timestamp = unix_timestamp();
 
         dbg!(timestamp);
-        dbg!(get_job_resource_usage(&job_info, &pids)?);
+        let job_resource_usage = get_job_resource_usage(&job_info, &pids)?;
+        dbg!(&job_resource_usage);
 
-        thread::sleep(time::Duration::from_millis(500));
+        log_usage_stats(timestamp, &job_resource_usage, &mut csv_writer)?;
+
+        thread::sleep(sleep_interval);
     }
 
     Ok(())
 }
-
-//  17179869184
-// 119614873600
