@@ -1,13 +1,15 @@
 use chrono::NaiveDateTime;
+use gethostname::gethostname;
 use nvml_wrapper::enums::device::UsedGpuMemory;
 use nvml_wrapper::struct_wrappers::device::{ProcessInfo, ProcessUtilizationSample};
 use nvml_wrapper::{Device, Nvml};
 use regex::Regex;
 use serde::Serialize;
 use std::collections::HashSet;
+use std::fs::{self, exists, read_to_string};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{env, thread, time};
+use std::{dbg, env, thread, time};
 
 const SHARDS_PER_GPU: u16 = 2;
 
@@ -17,10 +19,10 @@ enum JobPIDs {
     PIDs(Vec<u32>),
 }
 
-fn get_job_pids(job_id: &str) -> Result<JobPIDs, String> {
+fn get_job_pids(job_id: u32) -> Result<JobPIDs, String> {
     let listpids_output = Command::new("scontrol")
         .arg("listpids")
-        .arg(job_id)
+        .arg(job_id.to_string())
         .output()
         .map_err(|err| format!("failed to run listpids command: {err}"))?;
 
@@ -147,7 +149,7 @@ fn get_job_info(job_id: &str) -> Result<JobInfo, String> {
     let stdout = String::from_utf8_lossy(&scontrol_show_output.stdout);
     let stderr = String::from_utf8_lossy(&scontrol_show_output.stderr);
 
-    eprint!("{stdout}");
+    // eprint!("{stdout}");
     // eprint!("{stderr}");
 
     if !stderr.is_empty() {
@@ -203,9 +205,12 @@ fn get_job_info(job_id: &str) -> Result<JobInfo, String> {
         .map_err(|err| format!("failed to parse requested_cpus: {err}"))?;
 
     // this is always in megabytes I think
-    let requested_memory = get_first_regex_group(r"Mem=(\d+)", &stdout)?
+    let mut requested_memory = get_first_regex_group(r"Mem=(\d+)", &stdout)?
         .parse::<u64>()
         .map_err(|err| format!("failed to parse requested_memory: {err}"))?;
+
+    // to bytes
+    requested_memory *= 10_u64.pow(6);
 
     let is_gpu_job = stdout
         .lines()
@@ -218,6 +223,7 @@ fn get_job_info(job_id: &str) -> Result<JobInfo, String> {
             .parse::<u8>()
             .map_err(|err| format!("failed to parse requested_gpu_shards: {err}"))?;
 
+        // because of sharding we can have e.g. half of a gpu reserved
         let requested_gpus = f32::from(requested_gpu_shards) / f32::from(SHARDS_PER_GPU);
 
         let total_gpu_memory = get_total_gpu_memory(0)?; // assume all GPUs are equal
@@ -265,8 +271,17 @@ fn unix_timestamp() -> f64 {
 
 #[derive(Debug)]
 struct JobResourceUsage {
-    gpu_memory: u64,
+    // number of microseconds of cpu usage since the beginning of the job
+    cpu_utilization: u64,
+
+    // number of bytes used by the process at the point in time it was measured
+    memory: u64,
+
+    // GPU utilization as reported by NVML (same as nvidia-smi). It's defined a bit vagely in the documentation
     gpu_utilization: u32,
+
+    // number of bytes of GPU memory used as reported by NVML (sum of individual processes)
+    gpu_memory: u64,
 }
 
 fn gpu_utilization_stats(pids: &[u32]) -> Result<(u32, u64), String> {
@@ -326,16 +341,105 @@ fn gpu_utilization_stats(pids: &[u32]) -> Result<(u32, u64), String> {
     Ok((total_gpu_utilization, total_gpu_memory_usage))
 }
 
-fn get_job_resource_usage(pids: &[u32], is_gpu_job: bool) -> Result<JobResourceUsage, String> {
-    let (gpu_utilization, gpu_memory) = if is_gpu_job {
+fn get_cgroup_directory(job_id: u32) -> Result<String, String> {
+    let node = gethostname();
+    let node = node.to_str().ok_or("failed to get machine hostname")?;
+
+    let path = format!("/sys/fs/cgroup/system.slice/{node}_slurmstepd.scope/job_{job_id}");
+
+    let path_exists = exists(&path).map_err(|err| {
+        format!("unable to check existence cgroup directory for job {job_id} '{path}': {err}")
+    })?;
+
+    if !path_exists {
+        return Err(format!(
+            "cgroup directory for job {job_id} '{path}' does not exist"
+        ));
+    }
+
+    Ok(path)
+}
+
+fn get_memory_usage(job_id: u32) -> Result<u64, String> {
+    // get_cgroup_directory asserts existence so we can just assume that memory.current and memory.stat will exist in
+    // there
+    let cgroup_dir = get_cgroup_directory(job_id)?;
+
+    let memory_stat_path = format!("{cgroup_dir}/memory.stat");
+    let current_memory_path = format!("{cgroup_dir}/memory.current");
+
+    let mut current_mem_contents = read_to_string(&current_memory_path)
+        .map_err(|err| format!("failed to read {current_memory_path}: {err}"))?;
+
+    let mem_stat_contents = read_to_string(&memory_stat_path)
+        .map_err(|err| format!("failed to read {memory_stat_path}: {err}"))?;
+
+    current_mem_contents.retain(|c| !c.is_whitespace());
+
+    let current_mem: u64 = current_mem_contents
+        .parse()
+        .map_err(|err| {
+            format!("unable to parse current memory cgroup file contents '{current_mem_contents}' into u64: {err}")
+        })?;
+
+    let inactive_file_mem: u64 = mem_stat_contents
+        .lines()
+        .find(|line| line.starts_with("inactive_file"))
+        .ok_or("could not find inactive_file line")?
+        .split_whitespace()
+        .nth(1)
+        .ok_or("unable to get inactive_file value")?
+        .parse()
+        .map_err(|err| format!("unable to parse inactive_file value: {err}"))?;
+
+    if inactive_file_mem > current_mem {
+        return Err(format!(
+            "Inactive file memory ({inactive_file_mem}) is larger than  current memory({current_mem})"
+        ));
+    }
+
+    // calculate Working Set Size as memory.current - memory.stat:inactive_file, same as cAdvisor does (see explanation:
+    // https://itnext.io/from-rss-to-wss-navigating-the-depths-of-kubernetes-memory-metrics-4d7d77d8fdcb#0555 )
+    let mem_usage = current_mem - inactive_file_mem;
+
+    Ok(mem_usage)
+}
+
+fn get_cpu_usage(job_id: u32) -> Result<u64, String> {
+    let cgroup_dir = get_cgroup_directory(job_id)?;
+
+    // get_cgroup_directory asserts existence so we can just assume that cpu.stat will exist in there
+    let cpu_stat_path = format!("{cgroup_dir}/cpu.stat");
+
+    let usage_usec: u64 = read_to_string(&cpu_stat_path)
+        .map_err(|err| format!("unable to read cpu stat file '{cpu_stat_path}': {err}"))?
+        .lines()
+        .find(|line| line.starts_with("usage_usec "))
+        .ok_or("could not find usage_usec line")?
+        .split_whitespace()
+        .nth(1)
+        .ok_or("unable to get usage_usec value")?
+        .parse()
+        .map_err(|err| format!("unable to parse usage_usec: {err}"))?;
+
+    Ok(usage_usec)
+}
+
+fn get_job_resource_usage(job_info: &JobInfo, pids: &[u32]) -> Result<JobResourceUsage, String> {
+    let memory = get_memory_usage(job_info.job_id)?;
+    let cpu_utilization = get_cpu_usage(job_info.job_id)?;
+
+    let (gpu_utilization, gpu_memory) = if job_info.is_gpu_job {
         gpu_utilization_stats(pids)?
     } else {
         (0, 0)
     };
 
     Ok(JobResourceUsage {
-        gpu_memory,
+        cpu_utilization,
+        memory,
         gpu_utilization,
+        gpu_memory,
     })
 }
 
@@ -350,13 +454,18 @@ fn main() -> Result<(), String> {
     dbg!(&job_info);
 
     #[allow(clippy::never_loop)]
-    while let JobPIDs::PIDs(pids) = get_job_pids(&job_id)? {
+    while let JobPIDs::PIDs(pids) = get_job_pids(job_info.job_id)? {
         dbg!(&pids);
         let timestamp = unix_timestamp();
-        dbg!(get_job_resource_usage(&pids, job_info.is_gpu_job)?);
+
+        dbg!(timestamp);
+        dbg!(get_job_resource_usage(&job_info, &pids)?);
 
         thread::sleep(time::Duration::from_millis(500));
     }
 
     Ok(())
 }
+
+//  17179869184
+// 119614873600
