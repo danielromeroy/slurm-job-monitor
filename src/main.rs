@@ -226,13 +226,13 @@ fn get_job_info(job_id: &str) -> Result<JobInfo, String> {
         .parse::<u16>()
         .map_err(|err| format!("failed to parse requested_cpus: {err}"))?;
 
-    // this is always in megabytes I think
+    // this is always in MiB I think
     let mut requested_memory = get_first_regex_group(r"Mem=(\d+)", &stdout)?
         .parse::<u64>()
         .map_err(|err| format!("failed to parse requested_memory: {err}"))?;
 
     // to bytes
-    requested_memory *= 10_u64.pow(6);
+    requested_memory *= 1024_u64.pow(2);
 
     let is_gpu_job = stdout
         .lines()
@@ -344,7 +344,7 @@ fn gpu_utilization_stats(pids: &[u32]) -> Result<(u32, u64), String> {
         .iter()
         .sum();
 
-    dbg!(total_gpu_memory_usage);
+    // dbg!(total_gpu_memory_usage);
 
     let total_gpu_utilization: u32 = gpu_devices
         .iter()
@@ -487,6 +487,16 @@ fn log_usage_stats(
     Ok(())
 }
 
+fn save_job_info(job_info: &JobInfo, path: &str) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(job_info)
+        .map_err(|err| format!("failed to convert JobInfo to JSON: {err}"))?;
+
+    fs::write(path, json)
+        .map_err(|err| format!("failed to write job info JSON to '{path}': {err}"))?;
+
+    Ok(())
+}
+
 fn main() -> Result<(), String> {
     let args = Args::parse();
 
@@ -503,11 +513,11 @@ fn main() -> Result<(), String> {
     let Ok(job_id) = env::var("SLURM_JOB_ID") else {
         return Err("SLURM_JOB_ID is not set".to_string());
     };
-    dbg!(&job_id);
+    // dbg!(&job_id);
 
     let job_info = get_job_info(&job_id)?;
 
-    dbg!(&job_info);
+    // dbg!(&job_info);
 
     print!("{}", serde_json::to_string_pretty(&job_info).unwrap());
 
@@ -517,6 +527,8 @@ fn main() -> Result<(), String> {
             args.output_dir, err
         )
     })?;
+
+    save_job_info(&job_info, &format!("{}/job_info.json", args.output_dir))?;
 
     let mut csv_writer = csv::Writer::from_path(format!("{}/usage_stats.csv", args.output_dir))
         .map_err(|err| format!("unable to create CSV file: {err}"))?;
@@ -532,12 +544,12 @@ fn main() -> Result<(), String> {
         .map_err(|err| format!("failed to write output CSV header: {err}"))?;
 
     while let JobPIDs::PIDs(pids) = get_job_pids(job_info.job_id)? {
-        dbg!(&pids);
+        // dbg!(&pids);
         let timestamp = unix_timestamp();
 
-        dbg!(timestamp);
+        // dbg!(timestamp);
         let job_resource_usage = get_job_resource_usage(&job_info, &pids)?;
-        dbg!(&job_resource_usage);
+        // dbg!(&job_resource_usage);
 
         log_usage_stats(timestamp, &job_resource_usage, &mut csv_writer)?;
 
