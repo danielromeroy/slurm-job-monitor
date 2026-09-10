@@ -1,0 +1,301 @@
+---
+title: "Untitled"
+format: html
+editor: source
+---
+
+
+```{r}
+#| include: false
+library("tidyverse")
+library("rjson")
+```
+
+```{r}
+#| include: false
+results_dir = "~/ht_tmp/29750_report/"
+```
+
+
+```{r}
+#| include: false
+job_info = rjson::fromJSON(file=str_c(results_dir, "job_info.json"))
+
+if (job_info$is_array_task) {
+  job_name_pretty = str_c(job_info$job_name, " (", job_info$array_job_id, "_", job_info$array_task_id, ")")
+} else {
+  job_name_pretty = str_c(job_info$job_name, " (", job_info$job_id, ")")
+}
+
+job_info
+```
+
+# Resource usage of job `r job_name_pretty`
+
+### Job information
+
+**Job Name**: `r job_info$job_name`
+**User**: `r job_info$user_name` (`r job_info$user_id`)
+
+
+
+```{r}
+#| include: false
+stats = read_csv(str_c(results_dir, "usage_stats.csv")) |> 
+  arrange(timestamp)
+stats
+```
+
+
+
+```{r}
+#| include: false
+max_memory = stats |> pull(memory) |> max()
+max_memory = max(max_memory, job_info$requested_memory)
+
+memory_unit = "B"
+memory_conv_factor = 1
+
+if ((max_memory / 1024) > 5) {
+  memory_unit = "KiB"
+  memory_conv_factor = 1024
+} 
+
+if ((max_memory / 1024^2) > 5) {
+  memory_unit = "MiB"
+  memory_conv_factor = 1024^2
+}
+
+if ((max_memory / 1024^3) > 2) {
+  memory_unit = "GiB"
+  memory_conv_factor = 1024^3
+}
+
+if ((max_memory / 1024^4) > 1) {
+  memory_unit = "TiB"
+  memory_conv_factor = 1024^4
+}
+
+memory_unit
+
+stats = stats |> 
+  mutate(memory_converted = memory/memory_conv_factor)
+
+stats
+```
+
+```{r}
+#| include: false
+stats = stats |> 
+  mutate(time_from_start = timestamp - min(timestamp),
+         time_delta = time_from_start - lag(time_from_start, default = 0))
+
+
+time_unit = "seconds"
+time_conv_factor = 1
+
+max_time = stats |> pull(time_from_start) |> max()
+
+if ((max_time / 60) > 2) {
+  time_unit = "minutes"
+  time_conv_factor = 60
+}
+
+if ((max_time / 3600) > 2) {
+  time_unit = "hours"
+  time_conv_factor = 3600
+}
+
+if ((max_time / (3600 * 24)) > 2) {
+  time_unit = "days"
+  time_conv_factor = 3600 * 24
+}
+
+ time_unit
+ 
+ stats = stats |> 
+   mutate(time_converted = time_from_start / time_conv_factor)
+ stats
+```
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-width: 12
+#| fig-height: 4
+
+stats = stats |> 
+  mutate(cpu_usage_delta = cpu_usage - lag(cpu_usage, default = (min(cpu_usage)))) |> 
+  relocate(cpu_usage_delta, .after = cpu_usage) |> 
+  mutate(cpu_usage_ratio = cpu_usage_delta/(time_delta * 10^6)) |> 
+  relocate(cpu_usage_ratio, .after = cpu_usage_delta)
+
+requested_cpus_data = tibble(
+  time_converted = c(0, max(pull(stats, time_converted))),
+  cpu_usage_ratio = c(job_info$requested_cpus, job_info$requested_cpus)
+)
+
+stats |> 
+  ggplot(aes(x = time_converted, y = cpu_usage_ratio)) +
+  geom_line(data = requested_cpus_data,
+            linetype = "dashed",
+            color = "blue",
+            alpha = 0.5) +
+  geom_line() +
+  ylim(0, NA) +
+  labs(x = str_c("Elapsed time (", time_unit, ")"),
+       y = "CPU usage (n. of CPUs)") +
+  theme_minimal(base_family = "Avenir")
+```
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-width: 12
+#| fig-height: 4
+
+requested_mem_converted = job_info$requested_memory / memory_conv_factor
+
+requested_memory_data = tibble(
+  time_converted = c(0, max(pull(stats, time_converted))),
+  memory_converted = c(requested_mem_converted, requested_mem_converted)
+)
+
+stats |>
+  ggplot(aes(x = time_converted, y = memory_converted)) +
+  geom_line() +
+  geom_line(data = requested_memory_data,
+            linetype = "dashed",
+            color = "blue",
+            alpha = 0.5) +
+  ylim(0, NA) +
+  labs(x = str_c("Elapsed time (", time_unit, ")"),
+       y = str_c("Memory usage (", memory_unit, ")")) +
+  theme_minimal(base_family = "Avenir")
+```
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-width: 12
+#| fig-height: 4
+if (job_info$is_gpu_job) {
+  requested_gpu_percent = job_info$requested_gpus * 100
+  
+  requested_gpus_data = tibble(
+    time_converted = c(0, max(pull(stats, time_converted))),
+    gpu_usage = c(requested_gpu_percent, requested_gpu_percent)
+  )
+  
+  stats |> 
+    ggplot(aes(x = time_converted, y = gpu_usage)) +
+    geom_line(data = requested_gpus_data,
+              linetype = "dashed",
+              color = "blue",
+              alpha = 0.5) +
+    geom_line() +
+    ylim(0, NA) +
+    labs(x = str_c("Elapsed time (", time_unit, ")"),
+         y = "GPU usage (% of a whole GPU)") +
+    theme_minimal(base_family = "Avenir")
+}
+```
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-width: 12
+#| fig-height: 4
+
+if (job_info$is_gpu_job) {
+  max_gpu_memory = stats |> pull(memory) |> max()
+  max_gpu_memory = max(max_memory, job_info$requested_gpu_memory)
+  
+  gpu_memory_unit = "B"
+  gpu_memory_conv_factor = 1
+  
+  if ((max_gpu_memory / 1024) > 5) {
+    gpu_memory_unit = "KiB"
+    gpu_memory_conv_factor = 1024
+  } 
+  
+  if ((max_gpu_memory / 1024^2) > 5) {
+    gpu_memory_unit = "MiB"
+    gpu_memory_conv_factor = 1024^2
+  }
+  
+  if ((max_gpu_memory / 1024^3) > 2) {
+    gpu_memory_unit = "GiB"
+    gpu_memory_conv_factor = 1024^3
+  }
+  
+  if ((max_gpu_memory / 1024^4) > 1) {
+    gpu_memory_unit = "TiB"
+    gpu_memory_conv_factor = 1024^4
+  }
+  
+  gpu_memory_unit
+  
+  stats = stats |> 
+    mutate(gpu_memory_converted = gpu_memory/gpu_memory_conv_factor)
+  
+  requested_gpu_memory_converted = job_info$requested_gpu_memory / gpu_memory_conv_factor
+  
+  requested_gpu_memory_data = tibble(
+    time_converted = c(0, max(pull(stats, time_converted))),
+    gpu_memory_converted = c(requested_gpu_memory_converted, requested_gpu_memory_converted)
+  )
+  
+  stats
+  
+  stats |> 
+    ggplot(aes(x = time_converted, 
+               y = gpu_memory_converted)) +
+    geom_line(data = requested_gpu_memory_data,
+              linetype = "dashed",
+              color = "blue",
+              alpha = 0.5) +
+    geom_line() +
+    ylim(0, NA) +
+    labs(x = str_c("Elapsed time (", time_unit, ")"),
+         y = str_c("GPU memory usage (", gpu_memory_unit, ")")) +
+    theme_minimal(base_family = "Avenir")
+  
+}
+```
+
+```{r}
+get_bytes_unit = function(value) {
+  unit = "B"
+  conv_factor = 1
+  
+  if ((value / 1024) > 5) {
+    unit = "KiB"
+    conv_factor = 1024
+  } 
+  
+  if ((value / 1024^2) > 5) {
+    unit = "MiB"
+    conv_factor = 1024^2
+  }
+  
+  if ((value / 1024^3) > 2) {
+    unit = "GiB"
+    conv_factor = 1024^3
+  }
+  
+  if ((value / 1024^4) > 1) {
+    unit = "TiB"
+    conv_factor = 1024^4
+  }
+  
+  return(c(unit, conv_factor))
+}
+
+
+```
+
