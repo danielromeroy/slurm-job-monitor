@@ -10,9 +10,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{create_dir_all, exists, read_to_string};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::{dbg, env, thread};
+use std::{dbg, env, format, thread};
 use std::{eprintln, fs};
-// use taskstats::TaskstatsConnection;
 
 const SHARDS_PER_GPU: u16 = 2;
 
@@ -453,35 +452,21 @@ struct IOStats {
     write_bytes: u64,
 }
 
-fn get_process_io(pid: u32) -> Result<IOStats, String> {
-    let proc_io_file_path = format!("/proc/{pid}/io");
+fn get_process_io(
+    pid: u32,
+    tasksstats_client: &mut linux_taskstats::Client,
+) -> Result<IOStats, String> {
+    eprintln!("getting process IO");
 
-    let proc_io_contents = read_to_string(&proc_io_file_path)
-        .map_err(|err| format!("failed to read {proc_io_file_path}: {err}"))?;
-
-    let read_bytes: u64 = proc_io_contents
-        .lines()
-        .find(|line| line.starts_with("read_bytes: "))
-        .ok_or("could not find read_bytes line")?
-        .split_whitespace()
-        .nth(1)
-        .ok_or("unable to get read_bytes value")?
-        .parse()
-        .map_err(|err| format!("unable to parse read_bytes: {err}"))?;
-
-    let write_bytes: u64 = proc_io_contents
-        .lines()
-        .find(|line| line.starts_with("write_bytes: "))
-        .ok_or("could not find write_bytes line")?
-        .split_whitespace()
-        .nth(1)
-        .ok_or("unable to get write_bytes value")?
-        .parse()
-        .map_err(|err| format!("unable to parse write_bytes: {err}"))?;
+    let stats = tasksstats_client.pid_stats(pid).map_err(|err| {
+        println!("ERROR: {err:?}");
+        println!("ERROR display: {err}");
+        format!("failed to get stats for pid {pid}: {err}")
+    })?;
 
     Ok(IOStats {
-        read_bytes,
-        write_bytes,
+        read_bytes: stats.blkio.read_bytes,
+        write_bytes: stats.blkio.write_bytes,
     })
 }
 
@@ -501,8 +486,18 @@ impl IOTracker {
     }
 
     fn update_process_stats(&mut self, pids: &[u32]) -> Result<(), String> {
+        let mut taskstats_client = linux_taskstats::Client::open()
+            .map_err(|err| format!("failed to create taskstats connection: {err}"))?;
+
         for pid in pids {
-            self.process_stats.insert(*pid, get_process_io(*pid)?);
+            match get_process_io(*pid, &mut taskstats_client) {
+                Ok(io_stats) => {
+                    self.process_stats.insert(*pid, io_stats);
+                }
+                Err(err) => {
+                    eprintln!("{err}");
+                }
+            }
         }
 
         Ok(())
@@ -639,6 +634,7 @@ fn main() -> Result<(), String> {
             Err(err) => eprintln!("{err}"),
         }
         let io_stats = io_tracker.get_total_io_stats();
+        dbg!(&io_stats);
 
         log_usage_stats(timestamp, &job_resource_usage, &io_stats, &mut csv_writer)?;
 
