@@ -6,12 +6,13 @@ use nvml_wrapper::struct_wrappers::device::{ProcessInfo, ProcessUtilizationSampl
 use nvml_wrapper::{Device, Nvml};
 use regex::Regex;
 use serde::Serialize;
-use std::collections::HashSet;
-use std::fs;
+use std::collections::{HashMap, HashSet};
 use std::fs::{create_dir_all, exists, read_to_string};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{dbg, env, thread};
+use std::{eprintln, fs};
+// use taskstats::TaskstatsConnection;
 
 const SHARDS_PER_GPU: u16 = 2;
 
@@ -299,7 +300,8 @@ struct JobResourceUsage {
     // number of bytes used by the process at the point in time it was measured
     memory: u64,
 
-    // GPU utilization as reported by NVML (same as nvidia-smi). It's defined a bit vagely in the documentation
+    // GPU utilization as reported by NVML (same as nvidia-smi). It's defined a bit vagely in the documentation, but it
+    // should generally mean "what percent of the max amount of possible number crunching is being done"
     gpu_utilization: u32,
 
     // number of bytes of GPU memory used as reported by NVML (sum of individual processes)
@@ -343,8 +345,6 @@ fn gpu_utilization_stats(pids: &[u32]) -> Result<(u32, u64), String> {
         .collect::<Result<Vec<u64>, String>>()?
         .iter()
         .sum();
-
-    // dbg!(total_gpu_memory_usage);
 
     let total_gpu_utilization: u32 = gpu_devices
         .iter()
@@ -447,6 +447,83 @@ fn get_cpu_usage(job_id: u32) -> Result<u64, String> {
     Ok(usage_usec)
 }
 
+#[derive(Debug)]
+struct IOStats {
+    read_bytes: u64,
+    write_bytes: u64,
+}
+
+fn get_process_io(pid: u32) -> Result<IOStats, String> {
+    let proc_io_file_path = format!("/proc/{pid}/io");
+
+    let proc_io_contents = read_to_string(&proc_io_file_path)
+        .map_err(|err| format!("failed to read {proc_io_file_path}: {err}"))?;
+
+    let read_bytes: u64 = proc_io_contents
+        .lines()
+        .find(|line| line.starts_with("read_bytes: "))
+        .ok_or("could not find read_bytes line")?
+        .split_whitespace()
+        .nth(1)
+        .ok_or("unable to get read_bytes value")?
+        .parse()
+        .map_err(|err| format!("unable to parse read_bytes: {err}"))?;
+
+    let write_bytes: u64 = proc_io_contents
+        .lines()
+        .find(|line| line.starts_with("write_bytes: "))
+        .ok_or("could not find write_bytes line")?
+        .split_whitespace()
+        .nth(1)
+        .ok_or("unable to get write_bytes value")?
+        .parse()
+        .map_err(|err| format!("unable to parse write_bytes: {err}"))?;
+
+    Ok(IOStats {
+        read_bytes,
+        write_bytes,
+    })
+}
+
+// this struct exists mostly because we need to remember the IO stats of any process that is no longer part of the job
+// (by tracking IO cumulatively we avoid having to remember the stats from the previous iteration, and we also get
+// global stats at the end)
+#[derive(Debug)]
+struct IOTracker {
+    process_stats: HashMap<u32, IOStats>,
+}
+
+impl IOTracker {
+    fn new() -> IOTracker {
+        IOTracker {
+            process_stats: HashMap::new(),
+        }
+    }
+
+    fn update_process_stats(&mut self, pids: &[u32]) -> Result<(), String> {
+        for pid in pids {
+            self.process_stats.insert(*pid, get_process_io(*pid)?);
+        }
+
+        Ok(())
+    }
+
+    fn get_total_io_stats(&self) -> IOStats {
+        let (read_bytes, write_bytes) = self
+            .process_stats
+            .values()
+            .map(|io_stats| (io_stats.read_bytes, io_stats.write_bytes))
+            .fold((0, 0), |(total_read, total_write), (read, write)| {
+                (total_read + read, total_write + write)
+            });
+
+        IOStats {
+            read_bytes,
+            write_bytes,
+        }
+    }
+}
+
 fn get_job_resource_usage(job_info: &JobInfo, pids: &[u32]) -> Result<JobResourceUsage, String> {
     let cpu_utilization = get_cpu_usage(job_info.job_id)?;
     let memory = get_memory_usage(job_info.job_id)?;
@@ -468,6 +545,7 @@ fn get_job_resource_usage(job_info: &JobInfo, pids: &[u32]) -> Result<JobResourc
 fn log_usage_stats(
     timestamp: f64,
     job_resource_usage: &JobResourceUsage,
+    io_stats: &IOStats,
     csv_writer: &mut csv::Writer<fs::File>,
 ) -> Result<(), String> {
     csv_writer
@@ -477,6 +555,8 @@ fn log_usage_stats(
             job_resource_usage.memory.to_string(),
             job_resource_usage.gpu_utilization.to_string(),
             job_resource_usage.gpu_memory.to_string(),
+            io_stats.read_bytes.to_string(),
+            io_stats.write_bytes.to_string(),
         ])
         .map_err(|err| format!("failed to write CSV record: {err}"))?;
 
@@ -513,11 +593,9 @@ fn main() -> Result<(), String> {
     let Ok(job_id) = env::var("SLURM_JOB_ID") else {
         return Err("SLURM_JOB_ID is not set".to_string());
     };
-    // dbg!(&job_id);
 
     let job_info = get_job_info(&job_id)?;
-
-    // dbg!(&job_info);
+    dbg!(&job_info);
 
     print!("{}", serde_json::to_string_pretty(&job_info).unwrap());
 
@@ -533,6 +611,8 @@ fn main() -> Result<(), String> {
     let mut csv_writer = csv::Writer::from_path(format!("{}/usage_stats.csv", args.output_dir))
         .map_err(|err| format!("unable to create CSV file: {err}"))?;
 
+    let mut io_tracker = IOTracker::new();
+
     csv_writer
         .write_record(vec![
             "timestamp",
@@ -540,18 +620,27 @@ fn main() -> Result<(), String> {
             "memory",
             "gpu_usage",
             "gpu_memory",
+            "io_read",
+            "io_written",
         ])
         .map_err(|err| format!("failed to write output CSV header: {err}"))?;
 
     while let JobPIDs::PIDs(pids) = get_job_pids(job_info.job_id)? {
-        // dbg!(&pids);
         let timestamp = unix_timestamp();
+        dbg!(&timestamp);
+        dbg!(&pids);
 
-        // dbg!(timestamp);
         let job_resource_usage = get_job_resource_usage(&job_info, &pids)?;
-        // dbg!(&job_resource_usage);
+        dbg!(&timestamp);
+        dbg!(&job_resource_usage);
 
-        log_usage_stats(timestamp, &job_resource_usage, &mut csv_writer)?;
+        match io_tracker.update_process_stats(&pids) {
+            Ok(()) => (),
+            Err(err) => eprintln!("{err}"),
+        }
+        let io_stats = io_tracker.get_total_io_stats();
+
+        log_usage_stats(timestamp, &job_resource_usage, &io_stats, &mut csv_writer)?;
 
         thread::sleep(sleep_interval);
     }
