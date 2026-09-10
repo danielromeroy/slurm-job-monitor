@@ -4,7 +4,6 @@ format: html
 editor: source
 ---
 
-
 ```{r}
 #| include: false
 library("tidyverse")
@@ -12,10 +11,38 @@ library("rjson")
 ```
 
 ```{r}
-#| include: false
-results_dir = "~/ht_tmp/29835_report/"
+get_bytes_unit = function(value) {
+  unit = "B"
+  conv_factor = 1
+  
+  if ((value / 1024) > 5) {
+    unit = "KiB"
+    conv_factor = 1024
+  } 
+  
+  if ((value / 1024^2) > 5) {
+    unit = "MiB"
+    conv_factor = 1024^2
+  }
+  
+  if ((value / 1024^3) > 2) {
+    unit = "GiB"
+    conv_factor = 1024^3
+  }
+  
+  if ((value / 1024^4) > 1) {
+    unit = "TiB"
+    conv_factor = 1024^4
+  }
+  
+  return(list(unit = unit, conv_factor=conv_factor))
+}
 ```
 
+```{r}
+#| include: false
+results_dir = "~/ht_tmp/29837_report/"
+```
 
 ```{r}
 #| include: false
@@ -37,50 +64,10 @@ job_info
 **Job Name**: `r job_info$job_name`
 **User**: `r job_info$user_name` (`r job_info$user_id`)
 
-
-
 ```{r}
 #| include: false
 stats = read_csv(str_c(results_dir, "usage_stats.csv")) |> 
   arrange(timestamp)
-stats
-```
-
-
-
-```{r}
-#| include: false
-max_memory = stats |> pull(memory) |> max()
-max_memory = max(max_memory, job_info$requested_memory)
-
-memory_unit = "B"
-memory_conv_factor = 1
-
-if ((max_memory / 1024) > 5) {
-  memory_unit = "KiB"
-  memory_conv_factor = 1024
-} 
-
-if ((max_memory / 1024^2) > 5) {
-  memory_unit = "MiB"
-  memory_conv_factor = 1024^2
-}
-
-if ((max_memory / 1024^3) > 2) {
-  memory_unit = "GiB"
-  memory_conv_factor = 1024^3
-}
-
-if ((max_memory / 1024^4) > 1) {
-  memory_unit = "TiB"
-  memory_conv_factor = 1024^4
-}
-
-memory_unit
-
-stats = stats |> 
-  mutate(memory_converted = memory/memory_conv_factor)
-
 stats
 ```
 
@@ -157,6 +144,16 @@ stats |>
 #| fig-width: 12
 #| fig-height: 4
 
+max_memory = stats |> pull(memory) |> max()
+max_memory = max(max_memory, job_info$requested_memory)
+
+bytes_unit = get_bytes_unit(max_memory)
+memory_unit = bytes_unit$unit
+memory_conv_factor = bytes_unit$conv_factor
+
+stats = stats |> 
+  mutate(memory_converted = memory/memory_conv_factor)
+
 requested_mem_converted = job_info$requested_memory / memory_conv_factor
 
 requested_memory_data = tibble(
@@ -216,30 +213,9 @@ if (job_info$is_gpu_job) {
   max_gpu_memory = stats |> pull(memory) |> max()
   max_gpu_memory = max(max_memory, job_info$requested_gpu_memory)
   
-  gpu_memory_unit = "B"
-  gpu_memory_conv_factor = 1
-  
-  if ((max_gpu_memory / 1024) > 5) {
-    gpu_memory_unit = "KiB"
-    gpu_memory_conv_factor = 1024
-  } 
-  
-  if ((max_gpu_memory / 1024^2) > 5) {
-    gpu_memory_unit = "MiB"
-    gpu_memory_conv_factor = 1024^2
-  }
-  
-  if ((max_gpu_memory / 1024^3) > 2) {
-    gpu_memory_unit = "GiB"
-    gpu_memory_conv_factor = 1024^3
-  }
-  
-  if ((max_gpu_memory / 1024^4) > 1) {
-    gpu_memory_unit = "TiB"
-    gpu_memory_conv_factor = 1024^4
-  }
-  
-  gpu_memory_unit
+  bytes_unit = get_bytes_unit(max_gpu_memory)
+  gpu_memory_unit = bytes_unit$unit
+  gpu_memory_conv_factor = bytes_unit$conv_factor
   
   stats = stats |> 
     mutate(gpu_memory_converted = gpu_memory/gpu_memory_conv_factor)
@@ -267,36 +243,6 @@ if (job_info$is_gpu_job) {
     theme_minimal(base_family = "Avenir")
   
 }
-```
-
-```{r}
-get_bytes_unit = function(value) {
-  unit = "B"
-  conv_factor = 1
-  
-  if ((value / 1024) > 5) {
-    unit = "KiB"
-    conv_factor = 1024
-  } 
-  
-  if ((value / 1024^2) > 5) {
-    unit = "MiB"
-    conv_factor = 1024^2
-  }
-  
-  if ((value / 1024^3) > 2) {
-    unit = "GiB"
-    conv_factor = 1024^3
-  }
-  
-  if ((value / 1024^4) > 1) {
-    unit = "TiB"
-    conv_factor = 1024^4
-  }
-  
-  return(list(unit = unit, conv_factor=conv_factor))
-}
-
 ```
 
 
@@ -355,7 +301,4 @@ stats |>
   labs(x = str_c("Elapsed time (", time_unit, ")"),
        y = str_c("I/O read (", io_read_speed_unit, "/s)")) +
   theme_minimal(base_family = "Avenir")
-
-
 ```
-

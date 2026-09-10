@@ -514,12 +514,14 @@ fn get_process_io(pid: u32) -> Result<IOStats, String> {
 #[derive(Debug)]
 struct IOTracker {
     process_stats: HashMap<u32, IOStats>,
+    seen_parent_pids: HashSet<u32>,
 }
 
 impl IOTracker {
     fn new() -> IOTracker {
         IOTracker {
             process_stats: HashMap::new(),
+            seen_parent_pids: HashSet::new(),
         }
     }
 
@@ -540,16 +542,13 @@ impl IOTracker {
             })
             .collect();
 
+        self.seen_parent_pids.extend(&parent_pids);
+
         let leaf_pids: Vec<u32> = pids
             .iter()
-            .filter(|pid| !parent_pids.contains(*pid))
+            .filter(|pid| !self.seen_parent_pids.contains(*pid))
             .copied()
             .collect();
-
-        eprintln!("hi");
-        dbg!(&pids);
-        dbg!(&parent_pids);
-        dbg!(&leaf_pids);
 
         for pid in leaf_pids {
             match get_process_io(pid) {
