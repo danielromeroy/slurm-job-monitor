@@ -13,7 +13,7 @@ library("rjson")
 
 ```{r}
 #| include: false
-results_dir = "~/ht_tmp/29750_report/"
+results_dir = "~/ht_tmp/29835_report/"
 ```
 
 
@@ -88,7 +88,8 @@ stats
 #| include: false
 stats = stats |> 
   mutate(time_from_start = timestamp - min(timestamp),
-         time_delta = time_from_start - lag(time_from_start, default = 0))
+         time_delta = time_from_start - lag(time_from_start, default = 0)) |> 
+  relocate(time_delta, .after = timestamp)
 
 
 time_unit = "seconds"
@@ -293,8 +294,67 @@ get_bytes_unit = function(value) {
     conv_factor = 1024^4
   }
   
-  return(c(unit, conv_factor))
+  return(list(unit = unit, conv_factor=conv_factor))
 }
+
+```
+
+
+```{r}
+#| fig-width: 12
+#| fig-height: 4
+
+stats = stats |> 
+  mutate(io_written_delta = io_written - lag(io_written),
+         io_write_speed = io_written_delta / time_delta)
+
+max_write_speed = stats |> 
+  pull(io_write_speed) |> 
+  max(na.rm = TRUE)
+
+bytes_unit = get_bytes_unit(max_write_speed)
+io_write_speed_unit = bytes_unit$unit
+io_write_speed_conv_factor = bytes_unit$conv_factor
+
+stats = stats |>
+  mutate(io_write_speed_converted = io_write_speed / io_write_speed_conv_factor)
+
+stats |>
+  ggplot(aes(x = time_converted, y = io_write_speed_converted)) +
+  geom_line() +
+  ylim(0, NA) +
+  labs(x = str_c("Elapsed time (", time_unit, ")"),
+       y = str_c("I/O write (", io_write_speed_unit, "/s)")) +
+  theme_minimal(base_family = "Avenir")
+
+```
+
+```{r}
+#| fig-width: 12
+#| fig-height: 4
+
+stats = stats |> 
+  mutate(io_read_delta = io_read - lag(io_read),
+         io_read_speed = io_read_delta / time_delta)
+
+max_read_speed = stats |> 
+  pull(io_read_speed) |> 
+  max(na.rm = TRUE)
+
+bytes_unit = get_bytes_unit(max_read_speed)
+io_read_speed_unit = bytes_unit$unit
+io_read_speed_conv_factor = bytes_unit$conv_factor
+
+stats = stats |>
+  mutate(io_read_speed_converted = io_read_speed / io_read_speed_conv_factor)
+
+stats |>
+  ggplot(aes(x = time_converted, y = io_read_speed_converted)) +
+  geom_line() +
+  ylim(0, NA) +
+  labs(x = str_c("Elapsed time (", time_unit, ")"),
+       y = str_c("I/O read (", io_read_speed_unit, "/s)")) +
+  theme_minimal(base_family = "Avenir")
 
 
 ```

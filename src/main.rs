@@ -10,8 +10,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{create_dir_all, exists, read_to_string};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::{dbg, env, format, thread};
+use std::{dbg, env, thread};
 use std::{eprintln, fs};
+// use taskstats::TaskstatsConnection;
 
 const SHARDS_PER_GPU: u16 = 2;
 
@@ -446,27 +447,64 @@ fn get_cpu_usage(job_id: u32) -> Result<u64, String> {
     Ok(usage_usec)
 }
 
+fn get_process_parent_pid(pid: u32) -> Result<u32, String> {
+    let proc_stat_file_path = format!("/proc/{pid}/stat");
+
+    let proc_stat_contents = read_to_string(&proc_stat_file_path)
+        .map_err(|err| format!("failed to read {proc_stat_file_path}: {err}"))?;
+
+    let proc_name_end_pos = proc_stat_contents
+        .rfind(')')
+        .ok_or_else(|| format!("malformed /proc/{pid}/stat: {proc_stat_contents}"))?;
+
+    let mut fields = proc_stat_contents[proc_name_end_pos + 1..].split_whitespace();
+
+    let parent_pid: u32 = fields
+        .nth(1)
+        .ok_or(format!(
+            "failed to get second field of proc stat file {proc_stat_file_path}"
+        ))?
+        .parse::<u32>()
+        .map_err(|err| format!("failed to parse ppid as u32: {err}"))?;
+
+    Ok(parent_pid)
+}
+
 #[derive(Debug)]
 struct IOStats {
     read_bytes: u64,
     write_bytes: u64,
 }
 
-fn get_process_io(
-    pid: u32,
-    tasksstats_client: &mut linux_taskstats::Client,
-) -> Result<IOStats, String> {
-    eprintln!("getting process IO");
+fn get_process_io(pid: u32) -> Result<IOStats, String> {
+    let proc_io_file_path = format!("/proc/{pid}/io");
 
-    let stats = tasksstats_client.pid_stats(pid).map_err(|err| {
-        println!("ERROR: {err:?}");
-        println!("ERROR display: {err}");
-        format!("failed to get stats for pid {pid}: {err}")
-    })?;
+    let proc_io_contents = read_to_string(&proc_io_file_path)
+        .map_err(|err| format!("failed to read {proc_io_file_path}: {err}"))?;
+
+    let read_bytes: u64 = proc_io_contents
+        .lines()
+        .find(|line| line.starts_with("read_bytes: "))
+        .ok_or("could not find read_bytes line")?
+        .split_whitespace()
+        .nth(1)
+        .ok_or("unable to get read_bytes value")?
+        .parse()
+        .map_err(|err| format!("unable to parse read_bytes: {err}"))?;
+
+    let write_bytes: u64 = proc_io_contents
+        .lines()
+        .find(|line| line.starts_with("write_bytes: "))
+        .ok_or("could not find write_bytes line")?
+        .split_whitespace()
+        .nth(1)
+        .ok_or("unable to get write_bytes value")?
+        .parse()
+        .map_err(|err| format!("unable to parse write_bytes: {err}"))?;
 
     Ok(IOStats {
-        read_bytes: stats.blkio.read_bytes,
-        write_bytes: stats.blkio.write_bytes,
+        read_bytes,
+        write_bytes,
     })
 }
 
@@ -485,22 +523,44 @@ impl IOTracker {
         }
     }
 
-    fn update_process_stats(&mut self, pids: &[u32]) -> Result<(), String> {
-        let mut taskstats_client = linux_taskstats::Client::open()
-            .map_err(|err| format!("failed to create taskstats connection: {err}"))?;
+    fn update_process_stats(&mut self, pids: &[u32]) {
+        // TODO: make it retunr the errors if there are any
 
-        for pid in pids {
-            match get_process_io(*pid, &mut taskstats_client) {
-                Ok(io_stats) => {
-                    self.process_stats.insert(*pid, io_stats);
-                }
+        // account only leaf processes (innacurate, but prevent double accounting)
+
+        let parent_pids: HashSet<u32> = pids
+            .iter()
+            .map(|pid| get_process_parent_pid(*pid))
+            .filter_map(|pid| match pid {
+                Ok(pid) => Some(pid),
                 Err(err) => {
-                    eprintln!("{err}");
+                    eprintln!("slurm_job_monitor: {err}");
+                    None
                 }
+            })
+            .collect();
+
+        let leaf_pids: Vec<u32> = pids
+            .iter()
+            .filter(|pid| !parent_pids.contains(*pid))
+            .copied()
+            .collect();
+
+        eprintln!("hi");
+        dbg!(&pids);
+        dbg!(&parent_pids);
+        dbg!(&leaf_pids);
+
+        for pid in leaf_pids {
+            match get_process_io(pid) {
+                Ok(io_stats) => {
+                    self.process_stats.insert(pid, io_stats);
+                }
+                Err(err) => eprintln!("{err}"),
             }
         }
 
-        Ok(())
+        dbg!(&self.process_stats);
     }
 
     fn get_total_io_stats(&self) -> IOStats {
@@ -629,12 +689,8 @@ fn main() -> Result<(), String> {
         dbg!(&timestamp);
         dbg!(&job_resource_usage);
 
-        match io_tracker.update_process_stats(&pids) {
-            Ok(()) => (),
-            Err(err) => eprintln!("{err}"),
-        }
+        io_tracker.update_process_stats(&pids);
         let io_stats = io_tracker.get_total_io_stats();
-        dbg!(&io_stats);
 
         log_usage_stats(timestamp, &job_resource_usage, &io_stats, &mut csv_writer)?;
 
